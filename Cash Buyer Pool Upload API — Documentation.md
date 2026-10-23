@@ -164,6 +164,20 @@ When a user clicks "Get Cash Buyers" for a property, the pool is queried using t
 }
 ```
 
+`push-tranchi` records `buyer_outreach.response_status = 'pushed'` only after a
+complete acknowledgement: explicit `ok: true`, nonnegative integer counts (not
+booleans), `meta.total` equal to the submitted batch size, and
+`created + updated + errors == meta.total`. The complete `meta.errors` list must
+contain exactly `errors` unique, in-range, zero-based batch indices with error
+messages. Existing buyers count as `updated`; valid partial rejections record
+only the accepted buyers, and a fully rejected batch records none.
+
+Missing, malformed, contradictory, or unreadable acknowledgements leave that
+batch unconfirmed: no success counts or outreach records are inferred, and no
+automatic retry is made. This does not prove that the server stored nothing.
+Other completely acknowledged batches retain their confirmed results. Agent
+callers must inspect the JSON `ok` field; human-mode failures exit nonzero.
+
 ### Error Responses
 
 | Status | Condition | Body |

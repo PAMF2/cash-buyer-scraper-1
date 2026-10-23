@@ -1709,14 +1709,15 @@ def _load_tranchi_token() -> str | None:
     return None
 
 
-def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 30.0) -> dict:
+def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 30.0) -> Any:
     """POST the cash-buyer batch to tranchi.ai and return the parsed envelope.
 
     Wraps the batch in `{"buyers": [...]}` — the recommended format per the
     Cash Buyer Pool Upload API docs. Response is the standard
     {ok, data:{created,updated,errors}, meta:{total,errors:[{index,error}]}}
     envelope; per-record validation errors come back in meta.errors[].
-    Raises urllib.error.URLError / HTTPError on transport failures.
+    Raises urllib.error.URLError / HTTPError on transport failures, or
+    ValueError if the response cannot be decoded as UTF-8 JSON.
     """
     import urllib.request
     import urllib.error
@@ -1734,6 +1735,40 @@ def _post_tranchi_cash_buyers(payload: list[dict], token: str, timeout: float = 
     )
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
+
+
+def _validate_push_acknowledgement(response: Any, batch_length: int) -> tuple[dict, list[dict]]:
+    """Validate complete batch accounting before trusting any reported success."""
+    if not isinstance(response, dict) or response.get("ok") is not True:
+        raise ValueError("response must be an object with explicit ok: true")
+    data, meta = response.get("data"), response.get("meta")
+    if not isinstance(data, dict) or not isinstance(meta, dict):
+        raise ValueError("data and meta must be objects")
+    for key in ("created", "updated", "errors"):
+        if type(data.get(key)) is not int or data[key] < 0:
+            raise ValueError(f"data.{key} must be a nonnegative integer")
+    if type(meta.get("total")) is not int or meta["total"] < 0:
+        raise ValueError("meta.total must be a nonnegative integer")
+    if meta["total"] != batch_length:
+        raise ValueError("meta.total must equal the submitted batch length")
+    if data["created"] + data["updated"] + data["errors"] != batch_length:
+        raise ValueError("created + updated + errors must equal the submitted batch length")
+    rejections = meta.get("errors")
+    if not isinstance(rejections, list) or len(rejections) != data["errors"]:
+        raise ValueError("meta.errors must list every rejection exactly once")
+    indices: set[int] = set()
+    for rejection in rejections:
+        if not isinstance(rejection, dict):
+            raise ValueError("each meta.errors entry must be an object")
+        index = rejection.get("index")
+        if type(index) is not int or not 0 <= index < batch_length:
+            raise ValueError("rejection index must be an integer within the submitted batch")
+        if index in indices:
+            raise ValueError("rejection indexes must be unique")
+        if not isinstance(rejection.get("error"), str) or not rejection["error"].strip():
+            raise ValueError("each rejection must have a nonempty string error")
+        indices.add(index)
+    return data, rejections
 
 
 @main.command("push-tranchi")
@@ -1871,34 +1906,36 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
         import urllib.error
         created = updated = err_count = 0
         per_record_errors: list[dict] = []
-        transport_errors: list[str] = []
+        batch_errors: list[str] = []
 
         for start in range(0, len(payload), batch_size):
             batch = payload[start:start + batch_size]
             try:
                 resp = _post_tranchi_cash_buyers(batch, token)
+                data, rejections = _validate_push_acknowledgement(resp, len(batch))
             except urllib.error.HTTPError as e:
-                transport_errors.append(f"batch {start}-{start+len(batch)}: HTTP {e.code} — {e.read()[:200].decode('utf-8', 'replace')}")
+                batch_errors.append(f"batch {start}-{start+len(batch)}: acknowledgement unconfirmed — HTTP {e.code} — {e.read()[:200].decode('utf-8', 'replace')}")
                 continue
             except (urllib.error.URLError, OSError) as e:
-                transport_errors.append(f"batch {start}-{start+len(batch)}: transport error — {e}")
+                batch_errors.append(f"batch {start}-{start+len(batch)}: acknowledgement unconfirmed — transport error — {e}")
+                continue
+            except ValueError as e:
+                # Includes JSON and Unicode decoding failures from the response.
+                batch_errors.append(f"batch {start}-{start+len(batch)}: acknowledgement unconfirmed — invalid response — {e}")
                 continue
 
-            data = resp.get("data") or {}
-            created   += int(data.get("created") or 0)
-            updated   += int(data.get("updated") or 0)
-            err_count += int(data.get("errors")  or 0)
+            created   += data["created"]
+            updated   += data["updated"]
+            err_count += data["errors"]
 
-            # The server reports per-record errors against the *batch* index.
-            # Translate back to the global index + the actual external_id.
-            for er in (resp.get("meta") or {}).get("errors", []):
-                bi = er.get("index", -1)
-                eid = batch[bi]["external_id"] if 0 <= bi < len(batch) else None
-                per_record_errors.append({"external_id": eid, "error": er.get("error")})
+            # Only validated batch-relative indexes can identify rejected buyers.
+            for rejection in rejections:
+                eid = batch[rejection["index"]]["external_id"]
+                per_record_errors.append({"external_id": eid, "error": rejection["error"]})
 
             # Log successful pushes to buyer_outreach so subsequent runs can
             # exclude them with --no-recent-outreach (existing pattern).
-            err_indices = {er.get("index") for er in (resp.get("meta") or {}).get("errors", [])}
+            err_indices = {rejection["index"] for rejection in rejections}
             for i, rec in enumerate(batch):
                 if i in err_indices:
                     continue
@@ -1913,11 +1950,11 @@ def cmd_push_tranchi(top: int, market: str | None, batch_size: int,
                 )
         conn.commit()
 
-    ok = not transport_errors and (created + updated) > 0
+    ok = not batch_errors and (created + updated) > 0
     _emit(agent, ok,
           {"created": created, "updated": updated, "errors": err_count,
            "candidates": len(payload), "per_record_errors": per_record_errors},
-          errors=transport_errors,
+          errors=batch_errors,
           meta={"top": top, "market": market, "batch_size": batch_size,
                 "url": TRANCHI_CASH_BUYERS_URL})
 
